@@ -5,6 +5,7 @@ load("//rs/private:annotations.bzl", "WELL_KNOWN_ANNOTATIONS", "annotation_for",
 load("//rs/private:cargo_credentials.bzl", "load_cargo_credentials")
 load("//rs/private:cfg_parser.bzl", "cfg_matches_expr_for_cfg_attrs", "triple_to_cfg_attrs")
 load("//rs/private:crate_git_repository.bzl", "crate_git_repository")
+load("//rs/private:crate_path_repository.bzl", "crate_path_repository")
 load("//rs/private:crate_repository.bzl", "crate_repository")
 load("//rs/private:downloader.bzl", "download_metadata_for_git_crates", "download_sparse_registry_configs", "new_downloader_state", "parse_git_url", "sharded_path", "start_crate_registry_downloads", "start_github_downloads")
 load("//rs/private:git_repository.bzl", "git_repository")
@@ -119,6 +120,8 @@ def _generate_hub_and_spokes(
         cargo_config,
         validate_lockfile,
         debug,
+        generate_path_deps = False,
+        path_deps_exclude = [],
         dry_run = False):
     """Generates repositories for the transitive closure of the Cargo workspace.
 
@@ -135,6 +138,8 @@ def _generate_hub_and_spokes(
         cargo_config (label): .cargo/config.toml file
         validate_lockfile (bool): If true, validte we have appropriate versions in Cargo.lock
         debug (bool): Enable debug logging
+        generate_path_deps (bool): If true, generate repos for local path dependencies.
+        path_deps_exclude (list[string]): Crate names to exclude from path dep generation.
         dry_run (bool): Run all computations but do not create repos. Useful for benchmarking.
     """
     _date(mctx, "start")
@@ -540,6 +545,51 @@ crate.annotation(
 
     _date(mctx, "created repos")
 
+    # Generate repositories for local path dependencies if enabled
+    path_dep_repos = {}  # name -> (version, spoke_repo)
+    if generate_path_deps and not dry_run:
+        repo_root = _normalize_path(cargo_metadata["workspace_root"])
+        workspace_cargo_toml_label = str(cargo_lock_path).removesuffix("Cargo.lock") + "Cargo.toml"
+
+        for package in cargo_metadata["packages"]:
+            crate_name = package["name"]
+
+            # Skip excluded crates
+            if crate_name in path_deps_exclude:
+                continue
+
+            version = package["version"]
+            manifest_path = _normalize_path(package["manifest_path"])
+
+            repo_name = _spoke_repo(hub_name, crate_name, version)
+
+            crate_path_repository(
+                name = repo_name,
+                hub_name = hub_name,
+                source_cargo_toml = manifest_path,
+                workspace_cargo_toml = workspace_cargo_toml_label,
+                gen_build_script = "auto",
+                build_script_deps = [],
+                build_script_deps_select = {},
+                build_script_data = [],
+                build_script_data_select = {},
+                build_script_env = {},
+                build_script_env_select = {},
+                build_script_toolchains = [],
+                build_script_tools = [],
+                build_script_tools_select = {},
+                rustc_flags = [],
+                data = [],
+                deps = [],
+                deps_select = {},
+                aliases = {},
+                crate_features = [],
+                crate_features_select = {},
+                gen_binaries = [],
+            )
+
+            path_dep_repos[crate_name] = (version, repo_name)
+
     mctx.report_progress("Initializing hub")
 
     hub_contents = []
@@ -578,6 +628,14 @@ alias(
     name = "{name}__{binary}",
     actual = ":{fq}__{binary}",
 )""".format(name = name, fq = fq, binary = binary))
+
+    # Add aliases for path dependencies
+    for crate_name, (version, spoke_repo) in path_dep_repos.items():
+        hub_contents.append("""
+alias(
+    name = "{name}-{version}",
+    actual = "@{spoke_repo}//:{name}",
+)""".format(name = crate_name, version = version, spoke_repo = spoke_repo))
 
     hub_contents.append(
         """
@@ -843,9 +901,9 @@ def _crate_impl(mctx):
 
             if cfg.debug:
                 for _ in range(25):
-                    _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, dry_run = True)
+                    _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, generate_path_deps = cfg.generate_path_deps, path_deps_exclude = cfg.path_deps_exclude, dry_run = True)
 
-            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug)
+            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, generate_path_deps = cfg.generate_path_deps, path_deps_exclude = cfg.path_deps_exclude)
 
     # Lay down the git repos we will need; per-crate git_repository can clone from these.
     git_sources = set()
@@ -902,6 +960,14 @@ _from_cargo = tag_class(
             default = False,
         ),
         "debug": attr.bool(),
+        "generate_path_deps": attr.bool(
+            doc = "If true, generate Bazel repositories for local path dependencies in the Cargo workspace.",
+            default = False,
+        ),
+        "path_deps_exclude": attr.string_list(
+            doc = "List of crate names to exclude from path dependency generation. Useful for workspace members with custom BUILD files.",
+            default = [],
+        ),
     },
 )
 

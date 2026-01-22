@@ -1,0 +1,9 @@
+[package]
+name = "main_crate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+vendored_crate = { path = "../vendored_crate" }
