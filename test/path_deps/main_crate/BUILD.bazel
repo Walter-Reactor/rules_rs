@@ -1,0 +1,10 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+# This library uses the generated path dependency repository.
+# main_crate is excluded from auto-generation (via path_deps_exclude in MODULE.bazel)
+# and must have a manual BUILD file, while vendored_crate is auto-generated.
+rust_library(
+    name = "main_crate",
+    srcs = ["src/lib.rs"],
+    deps = ["@path_deps//:vendored_crate-0.1.0"],
+)

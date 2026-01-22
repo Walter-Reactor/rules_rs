@@ -5,6 +5,7 @@ load("//rs/private:annotations.bzl", "WELL_KNOWN_ANNOTATIONS", "annotation_for",
 load("//rs/private:cargo_credentials.bzl", "load_cargo_credentials")
 load("//rs/private:cfg_parser.bzl", "cfg_matches_expr_for_cfg_attrs", "triple_to_cfg_attrs")
 load("//rs/private:crate_git_repository.bzl", "crate_git_repository")
+load("//rs/private:crate_path_repository.bzl", "crate_path_repository")
 load("//rs/private:crate_repository.bzl", "crate_repository")
 load("//rs/private:downloader.bzl", "download_metadata_for_git_crates", "download_sparse_registry_configs", "new_downloader_state", "parse_git_url", "sharded_path", "start_crate_registry_downloads", "start_github_downloads")
 load("//rs/private:git_repository.bzl", "git_repository")
@@ -83,7 +84,7 @@ def _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json, is_build
             fail("""
 
 ERROR: `crate.annotation` for `{name}` has a `workspace_cargo_toml` pointing to a Cargo.toml without a `workspace` section. Please correct it in your MODULE.bazel!
-Make sure you point to the `Cargo.toml` of the workspace, not of `{name}`!”
+Make sure you point to the `Cargo.toml` of the workspace, not of `{name}`!"
 
 """.format(name = annotation.crate))
 
@@ -106,6 +107,119 @@ Make sure you point to the `Cargo.toml` of the workspace, not of `{name}`!”
         return inherited
     return _spec_to_dep_dict_inner(dep, spec, is_build)
 
+# Internal rustc placeholder crates that should be filtered from dependencies.
+_RUSTC_INTERNAL_CRATES = [
+    "rustc-std-workspace-alloc",
+    "rustc-std-workspace-core",
+    "rustc-std-workspace-std",
+]
+
+def _parse_dependencies_from_cargo_toml(cargo_toml_json, annotation, workspace_cargo_toml_json):
+    """Parse dependencies and build-dependencies from a Cargo.toml.
+
+    Args:
+        cargo_toml_json: Parsed Cargo.toml as a dict.
+        annotation: The crate annotation containing workspace info.
+        workspace_cargo_toml_json: Parsed workspace Cargo.toml for inheritance.
+
+    Returns:
+        A list of dependency dicts.
+    """
+    dependencies = [
+        _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
+        for dep, spec in cargo_toml_json.get("dependencies", {}).items()
+    ] + [
+        _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json, is_build = True)
+        for dep, spec in cargo_toml_json.get("build-dependencies", {}).items()
+    ]
+
+    for target, value in cargo_toml_json.get("target", {}).items():
+        for dep, spec in value.get("dependencies", {}).items():
+            converted = _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
+            converted["target"] = target
+            dependencies.append(converted)
+
+    return dependencies
+
+def _filter_possible_deps(dependencies):
+    """Filter out dev dependencies and internal rustc crates, add default features.
+
+    Args:
+        dependencies: List of dependency dicts from _parse_dependencies_from_cargo_toml.
+
+    Returns:
+        Filtered list of possible dependencies with default features added.
+    """
+    possible_deps = [
+        dep
+        for dep in dependencies
+        if dep.get("kind") != "dev" and dep.get("package") not in _RUSTC_INTERNAL_CRATES
+    ]
+
+    for dep in possible_deps:
+        if dep.get("default_features", True):
+            _add_to_dict(dep, "features", "default")
+
+    return possible_deps
+
+def _link_package_dependencies(package, hub_name, versions_by_name, feature_resolutions_by_fq_crate, cfg_match_cache, platform_cfg_attrs, debug = False):
+    """Link a package's dependencies to their Bazel targets and feature resolutions.
+
+    Args:
+        package: The package dict containing feature_resolutions.
+        hub_name: Name of the hub repository.
+        versions_by_name: Dict mapping crate names to available versions.
+        feature_resolutions_by_fq_crate: Dict mapping fq crate names to feature resolutions.
+        cfg_match_cache: Cache for cfg expression matching results.
+        platform_cfg_attrs: Platform configuration attributes for matching.
+        debug: If True, print debug info when version resolution fails.
+    """
+    deps_by_name = {}
+    for maybe_fq_dep in package.get("dependencies", []):
+        idx = maybe_fq_dep.find(" ")
+        if idx != -1:
+            dep = maybe_fq_dep[:idx]
+            resolved_version = maybe_fq_dep[idx + 1:]
+            _add_to_dict(deps_by_name, dep, resolved_version)
+
+    for dep in package["feature_resolutions"].possible_deps:
+        dep_package = dep.get("package")
+        if not dep_package:
+            dep_package = dep["name"]
+
+        versions = versions_by_name.get(dep_package)
+        if not versions:
+            continue
+        if len(versions) == 1:
+            resolved_version = versions[0]
+        else:
+            versions = deps_by_name.get(dep_package)
+            if not versions:
+                continue
+            if len(versions) == 1:
+                resolved_version = versions[0]
+            else:
+                resolved_version = select_matching_version(dep["req"], versions)
+                if not resolved_version:
+                    if debug:
+                        print(package["name"], dep_package, versions, dep["req"])
+                    continue
+
+        dep_fq = _fq_crate(dep_package, resolved_version)
+        dep["bazel_target"] = "@%s//:%s" % (hub_name, dep_fq)
+        dep["feature_resolutions"] = feature_resolutions_by_fq_crate[dep_fq]
+
+        target = dep.get("target")
+        match = cfg_match_cache.get(target)
+        if not match:
+            match = cfg_matches_expr_for_cfg_attrs(target, platform_cfg_attrs)
+
+            # TODO(zbarsky): Figure out how to do this optimization safely.
+            #if len(match) == len(platform_cfg_attrs):
+            #    match = match_all
+            cfg_match_cache[target] = match
+        dep["target"] = set(match)
+
 def _generate_hub_and_spokes(
         mctx,
         hub_name,
@@ -118,6 +232,8 @@ def _generate_hub_and_spokes(
         cargo_credentials,
         cargo_config,
         validate_lockfile,
+        generate_path_deps,
+        path_deps_exclude,
         debug,
         dry_run = False):
     """Generates repositories for the transitive closure of the Cargo workspace.
@@ -134,6 +250,8 @@ def _generate_hub_and_spokes(
         cargo_credentials (dict): Mapping of registry to auth token.
         cargo_config (label): .cargo/config.toml file
         validate_lockfile (bool): If true, validte we have appropriate versions in Cargo.lock
+        generate_path_deps (bool): If true, generate repository rules for path dependencies.
+        path_deps_exclude (list[string]): Crate names to exclude from path dep generation.
         debug (bool): Enable debug logging
         dry_run (bool): Run all computations but do not create repos. Useful for benchmarking.
     """
@@ -153,8 +271,20 @@ def _generate_hub_and_spokes(
     existing_facts = getattr(mctx, "facts", {}) or {}
     facts = {}
 
-    # Ignore workspace members
-    workspace_members = [p for p in all_packages if "source" not in p]
+    # Split workspace members into those that get generated repos vs manual BUILD files
+    all_workspace_members = [p for p in all_packages if "source" not in p]
+
+    def _should_generate_path_dep(pkg):
+        if not generate_path_deps:
+            return False
+        return pkg["name"] not in path_deps_exclude
+
+    workspace_members_generated = [p for p in all_workspace_members if _should_generate_path_dep(p)]
+    workspace_members = [p for p in all_workspace_members if not _should_generate_path_dep(p)]
+
+    # Track names of generated path deps for dependency resolution
+    generated_path_dep_names = {p["name"]: p for p in workspace_members_generated}
+
     packages = [p for p in all_packages if p.get("source")]
 
     platform_cfg_attrs = [triple_to_cfg_attrs(triple, [], []) for triple in platform_triples]
@@ -238,19 +368,7 @@ def _generate_hub_and_spokes(
                     workspace_cargo_toml_json = package.get("workspace_cargo_toml_json")
                 strip_prefix = package.get("strip_prefix", "")
 
-                dependencies = [
-                    _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
-                    for dep, spec in cargo_toml_json.get("dependencies", {}).items()
-                ] + [
-                    _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json, is_build = True)
-                    for dep, spec in cargo_toml_json.get("build-dependencies", {}).items()
-                ]
-
-                for target, value in cargo_toml_json.get("target", {}).items():
-                    for dep, spec in value.get("dependencies", {}).items():
-                        converted = _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
-                        converted["target"] = target
-                        dependencies.append(converted)
+                dependencies = _parse_dependencies_from_cargo_toml(cargo_toml_json, annotation, workspace_cargo_toml_json)
 
                 if not dependencies and debug:
                     print(name, version, package["source"])
@@ -267,76 +385,69 @@ def _generate_hub_and_spokes(
             package["strip_prefix"] = fact["strip_prefix"]
 
         possible_features = fact["features"]
-        possible_deps = [
-            dep
-            for dep in fact["dependencies"]
-            if dep.get("kind") != "dev" and
-               dep.get("package") not in [
-                   # Internal rustc placeholder crates.
-                   "rustc-std-workspace-alloc",
-                   "rustc-std-workspace-core",
-                   "rustc-std-workspace-std",
-               ]
-        ]
-
-        for dep in possible_deps:
-            if dep.get("default_features", True):
-                _add_to_dict(dep, "features", "default")
+        possible_deps = _filter_possible_deps(fact["dependencies"])
 
         feature_resolutions = _new_feature_resolutions(package_index, possible_deps, possible_features, platform_triples)
         package["feature_resolutions"] = feature_resolutions
         feature_resolutions_by_fq_crate[_fq_crate(name, version)] = feature_resolutions
 
+    # Process generated path deps - parse their Cargo.toml and set up feature resolutions
+    repo_root = _normalize_path(cargo_metadata["workspace_root"])
+    workspace_cargo_toml_path = mctx.path(cargo_lock_path).dirname.get_child("Cargo.toml")
+    workspace_cargo_toml_json = run_toml2json(mctx, workspace_cargo_toml_path)
+
+    for path_dep_index, package in enumerate(workspace_members_generated):
+        name = package["name"]
+        version = package["version"]
+
+        _add_to_dict(versions_by_name, name, version)
+
+        # Find the manifest_path from cargo_metadata
+        # TODO(perf): This is O(n) per path dep. If performance becomes an issue with large
+        # workspaces, consider building a lookup dict from cargo_metadata["packages"] upfront.
+        # For typical workspaces with few path deps, this is acceptable since it only runs
+        # at module extension evaluation time, not build time.
+        manifest_path = package.get("manifest_path")
+        if not manifest_path:
+            # Fallback: look up in cargo_metadata
+            for meta_pkg in cargo_metadata["packages"]:
+                if meta_pkg["name"] == name and meta_pkg["version"] == version:
+                    manifest_path = meta_pkg["manifest_path"]
+                    package["manifest_path"] = manifest_path
+                    break
+            if not manifest_path:
+                fail("Could not find manifest_path for generated path dep: %s" % name)
+
+        cargo_toml_json = run_toml2json(mctx, manifest_path)
+
+        annotation = annotation_for(annotations, name, version)
+
+        dependencies = _parse_dependencies_from_cargo_toml(cargo_toml_json, annotation, workspace_cargo_toml_json)
+
+        possible_features = cargo_toml_json.get("features", {})
+        # Dev-dependencies are intentionally excluded from dependency resolution.
+        # This matches how registry packages are processed (see the sparse+ source handling above)
+        # and follows Cargo's behavior where dev-dependencies are only used for tests/examples.
+        possible_deps = _filter_possible_deps(dependencies)
+
+        # Use index after packages list so resolve() can access both
+        feature_resolutions = _new_feature_resolutions(len(packages) + path_dep_index, possible_deps, possible_features, platform_triples)
+        package["feature_resolutions"] = feature_resolutions
+        feature_resolutions_by_fq_crate[_fq_crate(name, version)] = feature_resolutions
+
+    # Combined list for resolve() - packages first, then generated path deps
+    all_resolvable_packages = packages + workspace_members_generated
+
     for package in packages:
-        deps_by_name = {}
-        for maybe_fq_dep in package.get("dependencies", []):
-            idx = maybe_fq_dep.find(" ")
-            if idx != -1:
-                dep = maybe_fq_dep[:idx]
-                resolved_version = maybe_fq_dep[idx + 1:]
-                _add_to_dict(deps_by_name, dep, resolved_version)
+        _link_package_dependencies(package, hub_name, versions_by_name, feature_resolutions_by_fq_crate, cfg_match_cache, platform_cfg_attrs, debug = True)
 
-        for dep in package["feature_resolutions"].possible_deps:
-            dep_package = dep.get("package")
-            if not dep_package:
-                dep_package = dep["name"]
-
-            versions = versions_by_name.get(dep_package)
-            if not versions:
-                continue
-            if len(versions) == 1:
-                resolved_version = versions[0]
-            else:
-                versions = deps_by_name.get(dep_package)
-                if not versions:
-                    continue
-                if len(versions) == 1:
-                    # TODO(zbarsky): validate?
-                    resolved_version = versions[0]
-                else:
-                    resolved_version = select_matching_version(dep["req"], versions)
-                    if not resolved_version:
-                        print(name, dep_package, versions, dep["req"])
-                        continue
-
-            dep_fq = _fq_crate(dep_package, resolved_version)
-            dep["bazel_target"] = "@%s//:%s" % (hub_name, dep_fq)
-            dep["feature_resolutions"] = feature_resolutions_by_fq_crate[dep_fq]
-
-            target = dep.get("target")
-            match = cfg_match_cache.get(target)
-            if not match:
-                match = cfg_matches_expr_for_cfg_attrs(target, platform_cfg_attrs)
-
-                # TODO(zbarsky): Figure out how to do this optimization safely.
-                #if len(match) == len(platform_cfg_attrs):
-                #    match = match_all
-                cfg_match_cache[target] = match
-            dep["target"] = set(match)
+    # Link dependencies for generated path deps
+    for package in workspace_members_generated:
+        _link_package_dependencies(package, hub_name, versions_by_name, feature_resolutions_by_fq_crate, cfg_match_cache, platform_cfg_attrs)
 
     _date(mctx, "set up resolutions")
 
-    workspace_fq_deps = _compute_workspace_fq_deps(workspace_members, versions_by_name)
+    workspace_fq_deps = _compute_workspace_fq_deps(workspace_members + workspace_members_generated, versions_by_name)
 
     workspace_dep_versions_by_name = {}
 
@@ -399,6 +510,17 @@ def _generate_hub_and_spokes(
             for triple in match:
                 feature_resolutions.features_enabled[triple].update(features)
 
+    # Add generated path deps to workspace_dep_versions_by_name so they get short hub aliases
+    for package in workspace_members_generated:
+        name = package["name"]
+        version = package["version"]
+        fq = _fq_crate(name, version)
+        versions = workspace_dep_versions_by_name.get(name)
+        if not versions:
+            versions = set()
+            workspace_dep_versions_by_name[name] = versions
+        versions.add(fq)
+
     # Set initial set of features from annotations
     for crate, annotation_versions in annotations.items():
         for version_key, annotation in annotation_versions.items():
@@ -416,7 +538,7 @@ def _generate_hub_and_spokes(
 
     _date(mctx, "set up initial deps!")
 
-    resolve(mctx, packages, feature_resolutions_by_fq_crate, debug)
+    resolve(mctx, all_resolvable_packages, feature_resolutions_by_fq_crate, debug)
 
     # Validate that we aren't trying to enable any `dep:foo` features that were not even in the lockfile.
     for package in packages:
@@ -537,6 +659,72 @@ crate.annotation(
                 workspace_cargo_toml = annotation.workspace_cargo_toml,
                 **kwargs
             )
+
+    # Generate repositories for generated path deps
+    for package in workspace_members_generated:
+        crate_name = package["name"]
+        version = package["version"]
+        manifest_path = package["manifest_path"]
+
+        feature_resolutions = feature_resolutions_by_fq_crate[_fq_crate(crate_name, version)]
+
+        annotation = annotation_for(annotations, crate_name, version)
+
+        kwargs = dict(
+            hub_name = hub_name,
+            additive_build_file = annotation.additive_build_file,
+            additive_build_file_content = annotation.additive_build_file_content,
+            gen_build_script = annotation.gen_build_script,
+            build_script_deps = [],
+            build_script_deps_select = _select(feature_resolutions.build_deps),
+            build_script_data = annotation.build_script_data,
+            build_script_data_select = annotation.build_script_data_select,
+            build_script_env = annotation.build_script_env,
+            build_script_toolchains = annotation.build_script_toolchains,
+            build_script_tools = annotation.build_script_tools,
+            build_script_tools_select = annotation.build_script_tools_select,
+            build_script_env_select = annotation.build_script_env_select,
+            rustc_flags = annotation.rustc_flags,
+            data = annotation.data,
+            deps = annotation.deps,
+            deps_select = _select(feature_resolutions.deps),
+            aliases = feature_resolutions.aliases,
+            gen_binaries = annotation.gen_binaries,
+            crate_features = annotation.crate_features,
+            crate_features_select = _select(feature_resolutions.features_enabled),
+            patch_args = annotation.patch_args,
+            patch_tool = annotation.patch_tool,
+            patches = annotation.patches,
+        )
+
+        repo_name = _spoke_repo(hub_name, crate_name, version)
+
+        # Use the absolute manifest_path directly
+        source_cargo_toml_path = _normalize_path(manifest_path)
+
+        if dry_run:
+            continue
+
+        # Provide workspace Cargo.toml for inheriting fields.
+        # We use canonical repo syntax (@@) to ensure the label resolves correctly
+        # regardless of the apparent repository name in different contexts.
+        # The cargo_lock label name may include a directory path (e.g., "path_deps/Cargo.lock"),
+        # so we extract the directory to construct the correct Cargo.toml path.
+        repo_prefix = "@@" + cargo_lock_path.repo_name if cargo_lock_path.repo_name else "@@"
+        cargo_lock_dir = paths.dirname(cargo_lock_path.name)
+        if cargo_lock_path.package:
+            workspace_cargo_toml_label = repo_prefix + "//" + cargo_lock_path.package + ":Cargo.toml"
+        elif cargo_lock_dir:
+            workspace_cargo_toml_label = repo_prefix + "//:" + cargo_lock_dir + "/Cargo.toml"
+        else:
+            workspace_cargo_toml_label = repo_prefix + "//:Cargo.toml"
+
+        crate_path_repository(
+            name = repo_name,
+            source_cargo_toml = source_cargo_toml_path,
+            workspace_cargo_toml = workspace_cargo_toml_label,
+            **kwargs
+        )
 
     _date(mctx, "created repos")
 
@@ -668,7 +856,14 @@ RESOLVED_PLATFORMS = select({{
         for dep in package["dependencies"]:
             bazel_target = dep.get("bazel_target")
             if not bazel_target:
-                bazel_target = "//" + paths.join(cargo_lock_path.package, _normalize_path(dep["path"]).removeprefix(repo_root + "/"))
+                dep_name = dep["name"]
+
+                # Check if this is a generated path dep - if so, reference via hub
+                if dep_name in generated_path_dep_names:
+                    dep_version = generated_path_dep_names[dep_name]["version"]
+                    bazel_target = "@%s//:%s-%s" % (hub_name, dep_name, dep_version)
+                else:
+                    bazel_target = "//" + paths.join(cargo_lock_path.package, _normalize_path(dep["path"]).removeprefix(repo_root + "/"))
 
                 # TODO(zbarsky): check if we actually need this?
                 aliases[bazel_target] = dep["name"]
@@ -843,9 +1038,9 @@ def _crate_impl(mctx):
 
             if cfg.debug:
                 for _ in range(25):
-                    _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, dry_run = True)
+                    _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.generate_path_deps, cfg.path_deps_exclude, cfg.debug, dry_run = True)
 
-            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug)
+            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, cargo_path, cfg.cargo_lock, hub_packages, sparse_registry_configs, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.generate_path_deps, cfg.path_deps_exclude, cfg.debug)
 
     # Lay down the git repos we will need; per-crate git_repository can clone from these.
     git_sources = set()
@@ -900,6 +1095,14 @@ _from_cargo = tag_class(
         "validate_lockfile": attr.bool(
             doc = "If true, fail if Cargo.lock versions don't satisfy Cargo.toml requirements.",
             default = False,
+        ),
+        "generate_path_deps": attr.bool(
+            doc = "Generate repository rules for path dependencies instead of expecting manual BUILD files.",
+            default = False,
+        ),
+        "path_deps_exclude": attr.string_list(
+            doc = "Crate names to exclude from path dep generation when generate_path_deps is True.",
+            default = [],
         ),
         "debug": attr.bool(),
     },

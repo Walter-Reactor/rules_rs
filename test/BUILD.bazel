@@ -3,6 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary")
 
 DISABLED = [
     "annotation_crate_features",
+    "path_deps",  # Has its own crate.from_cargo, not part of TESTS loop
     #"binaries",
     #"build_script_aliases",
     #"build_script_env_select",
@@ -60,6 +61,9 @@ filegroup(
     srcs = ["@%s//:_workspace_deps" % test for test in TESTS] + [
         "@binaries//:protoc-gen-prost__protoc-gen-prost",
         ":rust_binary",
+        # Verify generated path dependency works
+        "@path_deps//:vendored_crate-0.1.0",
+        "//path_deps/main_crate",
     ],
 )
 

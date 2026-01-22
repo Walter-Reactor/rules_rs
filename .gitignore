@@ -6,3 +6,6 @@ bazel-*
 target
 
 toml2json/target
+
+# Claude Code ctags index
+.claude/tags

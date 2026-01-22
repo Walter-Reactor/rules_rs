@@ -112,6 +112,17 @@ TESTS = [
 
 [use_repo(crate, test) for test in TESTS]
 
+# Test for generate_path_deps feature - generates repos for vendored path dependencies
+crate.from_cargo(
+    name = "path_deps",
+    cargo_lock = "//:path_deps/Cargo.lock",
+    cargo_toml = "//:path_deps/Cargo.toml",
+    generate_path_deps = True,
+    path_deps_exclude = ["main_crate"],  # Exclude main workspace crate, only generate for vendored_crate
+    platform_triples = RUST_TRIPLES,
+)
+use_repo(crate, "path_deps")
+
 crate.annotation(
     crate = "rustls",
     # Test for https://github.com/bazelbuild/rules_rust/issues/3626
