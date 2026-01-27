@@ -48,6 +48,11 @@ use core::{ptr, slice, str};
 #[cfg(feature = "no-panic")]
 use no_panic::no_panic;
 
+use library;
+
+/// A constant derived from the library crate.
+pub const ITOA_VALUE: u32 = library::LIBRARY_VALUE + 1;
+
 /// A correctly sized stack allocation for the formatted integer to be written
 /// into.
 ///
