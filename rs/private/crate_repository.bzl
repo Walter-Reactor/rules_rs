@@ -1,3 +1,4 @@
+load("@bazel_features//:features.bzl", "bazel_features")
 load("@bazel_tools//tools/build_defs/repo:cache.bzl", "get_default_canonical_id")
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "patch")
 load(":cargo_credentials.bzl", "load_cargo_credentials", "registry_auth_headers")
@@ -88,8 +89,13 @@ def _local_crate_repository_impl(rctx):
     if not root.exists:
         fail("crate path %s does not exist" % rctx.attr.path)
 
+    # On Windows, Bazel >= 9.0.1 replants workspace symlinks as relative
+    # `..\_main\...` paths that resolve at the output_base but not in the
+    # action execroot's `external/` (there is no `external/_main`). Symlink
+    # to the realpath instead so each action sees the source files directly.
+    is_windows = rctx.os.name.lower().startswith("windows")
     for entry in root.readdir():
-        rctx.symlink(entry, entry.basename)
+        rctx.symlink(entry.realpath if is_windows else entry, entry.basename)
 
     patch(rctx)
 
@@ -97,14 +103,9 @@ def _local_crate_repository_impl(rctx):
 
     rctx.file("BUILD.bazel", _generate_build_file(rctx, cargo_toml))
 
-    # Symlinks into the main workspace get replanted by Bazel >= 9.0.1 as
-    # relative `..\_main\...` paths before reproducible repos enter the
-    # contents cache. On Windows those paths dangle from the action
-    # execroot (no `execroot/_main/external/_main`), so actions fail to
-    # read the crate sources. Marking non-reproducible skips replanting
-    # and keeps the original absolute symlinks, which resolve from both
-    # views. See https://github.com/bazelbuild/bazel/issues/29515.
-    return rctx.repo_metadata(reproducible = False)
+    return rctx.repo_metadata(
+        reproducible = bazel_features.external_deps.repo_rules_relativize_symlinks and not is_windows,
+    )
 
 local_crate_repository = repository_rule(
     implementation = _local_crate_repository_impl,
